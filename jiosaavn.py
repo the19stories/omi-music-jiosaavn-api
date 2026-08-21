@@ -74,8 +74,8 @@ def _song_field(song, *keys):
     return ""
 
 
-def _artist_text(song):
-    """Collect artist names from both legacy and current search-result shapes."""
+def _artist_values(song):
+    """Collect individual artists from both legacy and current result shapes."""
     values = [_song_field(song, "primary_artists", "singers", "artist", "music")]
     more_info = song.get("more_info")
     if isinstance(more_info, dict):
@@ -88,7 +88,7 @@ def _artist_text(song):
                 for artist in artist_map.get(group, []) or []:
                     if isinstance(artist, dict) and artist.get("name"):
                         values.append(str(artist["name"]))
-    return " ".join(value for value in values if value)
+    return [value for value in values if value]
 
 
 def _match_strength(query, value):
@@ -126,12 +126,15 @@ def rank_search_results(songs, query):
             seen_ids.add(song_id)
 
         title = normalize_search_text(_song_field(song, "title", "song", "name"))
-        artists = normalize_search_text(_artist_text(song))
+        artists = [normalize_search_text(value) for value in _artist_values(song)]
         album = normalize_search_text(_song_field(song, "album"))
         language = normalize_search_text(_song_field(song, "language"))
 
         title_match = _match_strength(normalized_query, title)
-        artist_match = _match_strength(normalized_query, artists)
+        artist_match = max(
+            (_match_strength(normalized_query, artist) for artist in artists),
+            default=0,
+        )
         album_match = _match_strength(normalized_query, album)
         language_match = _match_strength(normalized_query, language)
 
