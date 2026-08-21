@@ -1,11 +1,12 @@
 import json
 import re
 import requests
+import html
+import unicodedata
 
 import endpoints
 import helper
 
-from traceback import print_exc
 from urllib.parse import quote
 
 
@@ -33,6 +34,129 @@ REQUEST_TIMEOUT = (3.05, 8)
 
 class JioSaavnUpstreamError(RuntimeError):
     """Raised when JioSaavn cannot provide a usable response."""
+
+
+# Keep the search request to one upstream call.  This deliberately only fixes a
+# very common misspelling; a broad fuzzy-correction list would make title
+# searches less predictable.
+QUERY_ALIASES = {
+    "the weekend": "the weeknd",
+}
+
+
+def normalize_search_text(value):
+    """Return a case-, punctuation-, whitespace-, and accent-insensitive key."""
+    value = html.unescape(str(value or ""))
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = value.casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).split())
+
+
+def canonical_search_query(query):
+    """Apply safe query aliases after normalization."""
+    normalized = normalize_search_text(query)
+    return QUERY_ALIASES.get(normalized, normalized)
+
+
+def _song_field(song, *keys):
+    """Read a search-result field, including the occasional nested metadata."""
+    for key in keys:
+        value = song.get(key)
+        if value:
+            return str(value)
+    more_info = song.get("more_info")
+    if isinstance(more_info, dict):
+        for key in keys:
+            value = more_info.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def _artist_text(song):
+    """Collect artist names from both legacy and current search-result shapes."""
+    values = [_song_field(song, "primary_artists", "singers", "artist", "music")]
+    more_info = song.get("more_info")
+    if isinstance(more_info, dict):
+        artist_map = more_info.get("artistMap")
+        if isinstance(artist_map, dict):
+            # Primary artists are most relevant, while the full artist list
+            # preserves useful singer/composer matches when that is all Saavn
+            # returns.
+            for group in ("primary_artists", "featured_artists", "artists"):
+                for artist in artist_map.get(group, []) or []:
+                    if isinstance(artist, dict) and artist.get("name"):
+                        values.append(str(artist["name"]))
+    return " ".join(value for value in values if value)
+
+
+def _match_strength(query, value):
+    """Score a field using the documented relevance categories."""
+    if not value:
+        return 0
+    if query == value:
+        return 1_000
+    if len(query) >= 3 and (query in value or value in query):
+        return 700
+    query_tokens = set(query.split())
+    value_tokens = set(value.split())
+    if query_tokens and value_tokens:
+        overlap = len(query_tokens & value_tokens)
+        if overlap:
+            return 200 + int(200 * overlap / len(query_tokens))
+    return 0
+
+
+def rank_search_results(songs, query):
+    """Deduplicate IDs and rank existing JioSaavn results without extra requests."""
+    normalized_query = canonical_search_query(query)
+    if not normalized_query:
+        return []
+
+    ranked = []
+    seen_ids = set()
+    for upstream_index, song in enumerate(songs or []):
+        if not isinstance(song, dict):
+            continue
+        song_id = str(song.get("id", "")).strip()
+        if song_id and song_id in seen_ids:
+            continue
+        if song_id:
+            seen_ids.add(song_id)
+
+        title = normalize_search_text(_song_field(song, "title", "song", "name"))
+        artists = normalize_search_text(_artist_text(song))
+        album = normalize_search_text(_song_field(song, "album"))
+        language = normalize_search_text(_song_field(song, "language"))
+
+        title_match = _match_strength(normalized_query, title)
+        artist_match = _match_strength(normalized_query, artists)
+        album_match = _match_strength(normalized_query, album)
+        language_match = _match_strength(normalized_query, language)
+
+        # Category weights preserve the requested precedence.  Language is
+        # treated as metadata around album strength so searches such as
+        # "Telugu" don't get buried beneath unrelated results.
+        if title_match == 1_000:
+            score = 7_000
+        elif artist_match == 1_000:
+            score = 6_000
+        elif title_match >= 700:
+            score = 5_000 + title_match
+        elif artist_match >= 700:
+            score = 4_000 + artist_match
+        elif album_match:
+            score = 3_000 + album_match
+        elif language_match:
+            score = 2_900 + language_match
+        else:
+            score = max(title_match, artist_match, album_match, language_match)
+
+        ranked.append((-score, upstream_index, song))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [song for _, _, song in ranked]
 
 
 # ============================================================
@@ -69,6 +193,8 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     if not query:
         return []
 
+    upstream_query = canonical_search_query(query) or query
+
     # --------------------------------------------------------
     # Direct JioSaavn song URL
     # --------------------------------------------------------
@@ -81,7 +207,7 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
                 return get_song(song_id, lyrics)
 
         except Exception:
-            print_exc()
+            pass
 
         return None
 
@@ -118,7 +244,7 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     search_url = (
         "https://www.jiosaavn.com/api.php"
         "?__call=search.getResults"
-        f"&q={quote(query)}"
+        f"&q={quote(upstream_query)}"
         f"&p={page}"
         f"&n={limit}"
         "&_format=json"
@@ -126,17 +252,6 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
         "&api_version=4"
         "&ctx=web6dot0"
     )
-
-    print()
-    print("=" * 70)
-    print("JioSaavn SEARCH")
-    print("=" * 70)
-    print("Query :", query)
-    print("Page  :", page)
-    print("Limit :", limit)
-    print("URL   :", search_url)
-    print("=" * 70)
-
 
     # --------------------------------------------------------
     # Request
@@ -146,26 +261,10 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
 
         response = session.get(search_url, timeout=REQUEST_TIMEOUT)
 
-        print(
-            "HTTP status:",
-            response.status_code
-        )
-
-        print(
-            "Response length:",
-            len(response.text)
-        )
-
         response.raise_for_status()
 
-    except requests.RequestException as e:
-
-        print(
-            "JioSaavn request failed:",
-            e
-        )
-
-        raise JioSaavnUpstreamError("JioSaavn search request failed") from e
+    except requests.RequestException as exc:
+        raise JioSaavnUpstreamError("JioSaavn search request failed") from exc
 
 
     # --------------------------------------------------------
@@ -177,14 +276,6 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     )
 
     if data is None:
-
-        print(
-            "Could not parse JioSaavn JSON."
-        )
-
-        print(
-            response.text[:2000]
-        )
 
         raise JioSaavnUpstreamError("JioSaavn returned invalid search JSON")
 
@@ -198,35 +289,10 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     )
 
 
-    print(
-        "Raw JioSaavn songs:",
-        len(songs_data)
-    )
-
-
     if not songs_data:
-
-        print(
-            "No songs found in JioSaavn response."
-        )
-
-        print(
-            "Response structure:"
-        )
-
-        try:
-            print(
-                json.dumps(
-                    data,
-                    indent=2,
-                    ensure_ascii=False
-                )[:5000]
-            )
-
-        except Exception:
-            print(data)
-
         return []
+
+    songs_data = rank_search_results(songs_data, query)
 
 
     # --------------------------------------------------------
@@ -269,18 +335,8 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
                 )
 
         except Exception:
+            continue
 
-            print(
-                "Error processing song:"
-            )
-
-            print_exc()
-
-
-    print(
-        "Complete songs:",
-        len(songs)
-    )
 
     return songs
 
@@ -519,12 +575,6 @@ def get_song(id, lyrics=False):
 
 
         if response.status_code != 200:
-
-            print(
-                "Song details HTTP:",
-                response.status_code
-            )
-
             return None
 
 
@@ -607,13 +657,6 @@ def get_song(id, lyrics=False):
 
 
     except Exception:
-
-        print(
-            "get_song error:"
-        )
-
-        print_exc()
-
         return None
 
 
@@ -668,8 +711,7 @@ def get_song_id(url):
 
 
     except Exception:
-
-        print_exc()
+        pass
 
 
     return None
@@ -720,15 +762,7 @@ def get_album(album_id, lyrics=False):
         )
 
 
-    except Exception as e:
-
-        print(
-            "get_album error:",
-            e
-        )
-
-        print_exc()
-
+    except Exception:
         return None
 
 
@@ -774,8 +808,7 @@ def get_album_id(input_url):
 
 
     except Exception:
-
-        print_exc()
+        pass
 
 
     return None
@@ -827,8 +860,7 @@ def get_playlist(listId, lyrics=False):
 
 
     except Exception:
-
-        print_exc()
+        pass
 
         return None
 
@@ -877,8 +909,7 @@ def get_playlist_id(input_url):
 
 
     except Exception:
-
-        print_exc()
+        pass
 
 
     return None
@@ -919,7 +950,4 @@ def get_lyrics(id):
 
 
     except Exception:
-
-        print_exc()
-
         return None

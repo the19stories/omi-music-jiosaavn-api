@@ -1,22 +1,73 @@
 from flask import Flask, request, redirect, jsonify
 import os
+import threading
+import time
 import jiosaavn
-from traceback import print_exc
 from flask_cors import CORS
 
 
 app = Flask(__name__)
-
-app.secret_key = os.environ.get(
-    "SECRET",
-    "thankyoutonystark#weloveyou3000"
-)
-
 CORS(app)
+
+MAX_QUERY_LENGTH = 200
+MAX_PAGE = 1_000
+MAX_LIMIT = 50
+RATE_LIMIT_REQUESTS = 120
+RATE_LIMIT_WINDOW_SECONDS = 60
+_rate_limit_lock = threading.Lock()
+_rate_limit_buckets = {}
 
 
 def api_error(message, status=502):
     return jsonify({"success": False, "status": False, "error": message}), status
+
+
+def _validated_query(error_message):
+    query = request.args.get("query", "").strip()
+    if not query:
+        return None, api_error(error_message, 400)
+    if len(query) > MAX_QUERY_LENGTH:
+        return None, api_error(
+            f"Query must be {MAX_QUERY_LENGTH} characters or fewer.", 400)
+    return query, None
+
+
+def _validated_positive_int(name, default, maximum):
+    raw_value = request.args.get(name)
+    if raw_value is None:
+        return default, None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return None, api_error(f"{name.title()} must be a whole number.", 400)
+    if not 1 <= value <= maximum:
+        return None, api_error(
+            f"{name.title()} must be between 1 and {maximum}.", 400)
+    return value, None
+
+
+@app.before_request
+def rate_limit():
+    """Small in-memory limiter suitable for an individual Render worker."""
+    if request.endpoint in {"healthz", "static"}:
+        return None
+    now = time.monotonic()
+    client = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    client = client.split(",", 1)[0].strip()
+    with _rate_limit_lock:
+        window_start, count = _rate_limit_buckets.get(client, (now, 0))
+        if now - window_start >= RATE_LIMIT_WINDOW_SECONDS:
+            window_start, count = now, 0
+        count += 1
+        _rate_limit_buckets[client] = (window_start, count)
+        if len(_rate_limit_buckets) > 10_000:
+            stale_before = now - RATE_LIMIT_WINDOW_SECONDS
+            for key, (started, _) in list(_rate_limit_buckets.items()):
+                if started < stale_before:
+                    _rate_limit_buckets.pop(key, None)
+    if count > RATE_LIMIT_REQUESTS:
+        return api_error("Too many requests. Please try again shortly.", 429)
+    return None
 
 
 @app.route('/healthz')
@@ -45,10 +96,9 @@ def search():
     lyrics = False
     songdata = True
 
-    query = request.args.get(
-        'query',
-        ''
-    ).strip()
+    query, error = _validated_query("Query is required to search songs!")
+    if error:
+        return error
 
     lyrics_ = request.args.get(
         'lyrics'
@@ -58,26 +108,18 @@ def search():
         'songdata'
     )
 
-    page = request.args.get(
-        'page',
-        1,
-        type=int
-    )
-
-    limit = request.args.get(
-        'limit',
-        20,
-        type=int
-    )
+    page, error = _validated_positive_int("page", 1, MAX_PAGE)
+    if error:
+        return error
+    limit, error = _validated_positive_int("limit", 20, MAX_LIMIT)
+    if error:
+        return error
 
     if lyrics_ and lyrics_.lower() != 'false':
         lyrics = True
 
     if songdata_ and songdata_.lower() != 'true':
         songdata = False
-
-    if not query:
-        return api_error("Query is required to search songs!", 400)
 
     try:
 
@@ -91,9 +133,7 @@ def search():
 
         return jsonify({"success": True, "results": results or []})
 
-    except Exception as e:
-
-        print_exc()
+    except Exception:
         return api_error("Unable to fetch search results")
 
 
@@ -133,10 +173,7 @@ def get_song():
 
         return jsonify({"success": True, "result": resp})
 
-    except Exception as e:
-
-        print_exc()
-
+    except Exception:
         return api_error("Unable to fetch song details")
 
 
@@ -188,13 +225,10 @@ def playlist():
             songs if songs else []
         )
 
-    except Exception as e:
-
-        print_exc()
-
+    except Exception:
         return jsonify({
             "status": False,
-            "error": str(e)
+            "error": "Unable to fetch playlist details"
         })
 
 
@@ -246,13 +280,10 @@ def album():
             songs if songs else []
         )
 
-    except Exception as e:
-
-        print_exc()
-
+    except Exception:
         return jsonify({
             "status": False,
-            "error": str(e)
+            "error": "Unable to fetch album details"
         })
 
 
@@ -310,13 +341,10 @@ def lyrics():
             "lyrics": lyrics_text
         })
 
-    except Exception as e:
-
-        print_exc()
-
+    except Exception:
         return jsonify({
             "status": False,
-            "error": str(e)
+            "error": "Unable to fetch lyrics"
         })
 
 
@@ -329,44 +357,20 @@ def result():
 
     lyrics = False
 
-    query = request.args.get(
-        'query',
-        ''
-    ).strip()
+    query, error = _validated_query("Query is required!")
+    if error:
+        return error
 
     lyrics_ = request.args.get(
         'lyrics'
     )
 
-    page = request.args.get(
-        'page',
-        1,
-        type=int
-    )
-
-    limit = request.args.get(
-        'limit',
-        20,
-        type=int
-    )
-
-    # --------------------------------------------------------
-    # Validate page
-    # --------------------------------------------------------
-
-    page = max(
-        1,
-        page
-    )
-
-    # --------------------------------------------------------
-    # Validate limit
-    # --------------------------------------------------------
-
-    limit = max(
-        1,
-        min(limit, 50)
-    )
+    page, error = _validated_positive_int("page", 1, MAX_PAGE)
+    if error:
+        return error
+    limit, error = _validated_positive_int("limit", 20, MAX_LIMIT)
+    if error:
+        return error
 
     # --------------------------------------------------------
     # Lyrics
@@ -375,18 +379,6 @@ def result():
     if lyrics_ and lyrics_.lower() != 'false':
         lyrics = True
 
-    # --------------------------------------------------------
-    # Query required
-    # --------------------------------------------------------
-
-    if not query:
-
-        return jsonify({
-            "status": False,
-            "error": "Query is required!"
-        })
-
-
     try:
 
         # ====================================================
@@ -394,15 +386,6 @@ def result():
         # ====================================================
 
         if 'saavn' not in query.lower():
-
-            print()
-            print("=" * 60)
-            print("SEARCH REQUEST")
-            print("=" * 60)
-            print("Query :", query)
-            print("Page  :", page)
-            print("Limit :", limit)
-            print("=" * 60)
 
             # IMPORTANT:
             #
@@ -419,11 +402,6 @@ def result():
                 limit=limit
             )
 
-            print(
-                "Results returned:",
-                len(results) if results else 0
-            )
-
             return jsonify({"success": True, "results": results or []})
 
 
@@ -432,10 +410,6 @@ def result():
         # ====================================================
 
         if '/song/' in query.lower():
-
-            print(
-                "JioSaavn Song URL"
-            )
 
             song_id = jiosaavn.get_song_id(
                 query
@@ -458,10 +432,6 @@ def result():
         # ====================================================
 
         elif '/album/' in query.lower():
-
-            print(
-                "JioSaavn Album URL"
-            )
 
             album_id = jiosaavn.get_album_id(
                 query
@@ -488,10 +458,6 @@ def result():
             or '/featured/' in query.lower()
         ):
 
-            print(
-                "JioSaavn Playlist URL"
-            )
-
             playlist_id = (
                 jiosaavn.get_playlist_id(
                     query
@@ -517,15 +483,7 @@ def result():
         return api_error("Unsupported JioSaavn URL.", 400)
 
 
-    except Exception as e:
-
-        print()
-        print(
-            "RESULT ENDPOINT ERROR:"
-        )
-
-        print_exc()
-
+    except Exception:
         return api_error("Unable to fetch JioSaavn results")
 
 
@@ -538,7 +496,7 @@ if __name__ == '__main__':
     app.run(
         host='0.0.0.0',
         port=int(os.environ.get('PORT', '5100')),
-        debug=os.environ.get('FLASK_DEBUG') == '1',
+        debug=False,
         use_reloader=False,
         threaded=True
     )
