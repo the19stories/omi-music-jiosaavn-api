@@ -23,7 +23,7 @@ class SearchRankingTests(unittest.TestCase):
             song("2", "Blinding Lights (duplicate)", "The Weeknd"),
             song("3", "Blinding Lights Remix", "The Weeknd"),
         ], "Blinding Lights")
-        self.assertEqual([item["id"] for item in results], ["2", "3", "1"])
+        self.assertEqual([item["id"] for item in results], ["2", "3"])
 
     def test_artist_alias_and_language_rank_highest(self):
         artist_results = jiosaavn.rank_search_results([
@@ -45,7 +45,48 @@ class SearchRankingTests(unittest.TestCase):
         results = jiosaavn.rank_search_results([
             song("2", "Weekend Party", "DJ Example"), nested_artist,
         ], "the weekend")
-        self.assertEqual(results[0]["id"], "1")
+        self.assertEqual([item["id"] for item in results], ["1"])
+
+    def test_artist_queries_reject_unrelated_results(self):
+        candidates = [
+            song("weeknd", "Starboy", "The Weeknd"),
+            song("blue-pink", "Blue Pink", "Blue Pink"),
+            song("hafizur", "A Random Song", "Hafizur Rahman"),
+            song("cover", "The Weeknd Cover", "Hafizur Rahman"),
+        ]
+        for query in ("The Weeknd", "the weekend"):
+            self.assertEqual(
+                [item["id"] for item in jiosaavn.rank_search_results(candidates, query)],
+                ["weeknd"],
+            )
+
+    def test_other_artist_queries_use_artist_metadata(self):
+        candidates = [
+            song("lana", "Video Games", "Lana Del Rey"),
+            song("arijit", "Kesariya", "Arijit Singh"),
+            song("noise", "Lana Party", "Someone Else"),
+        ]
+        self.assertEqual(
+            [item["id"] for item in jiosaavn.rank_search_results(candidates, "Lana Del Rey")],
+            ["lana"],
+        )
+        self.assertEqual(
+            [item["id"] for item in jiosaavn.rank_search_results(candidates, "Arijit Singh")],
+            ["arijit"],
+        )
+
+    def test_language_and_title_versions_are_retained(self):
+        language_results = jiosaavn.rank_search_results([
+            song("te", "Any Telugu Title", "Artist", album="Hits", language="telugu"),
+            song("hi", "Telugu Word Only", "Artist", language="hindi"),
+        ], "Telugu")
+        title_results = jiosaavn.rank_search_results([
+            song("original", "Blinding Lights", "The Weeknd"),
+            song("live", "Blinding Lights (Live)", "The Weeknd"),
+            song("unrelated", "Lights Out", "Someone"),
+        ], "Blinding Lights")
+        self.assertEqual([item["id"] for item in language_results], ["te"])
+        self.assertEqual([item["id"] for item in title_results], ["original", "live"])
 
 
 class ApiValidationTests(unittest.TestCase):

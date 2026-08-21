@@ -43,6 +43,17 @@ QUERY_ALIASES = {
     "the weekend": "the weeknd",
 }
 
+# These are metadata categories, not aliases.  Keeping this deliberately small
+# prevents an ordinary artist or title query from being mistaken for a language.
+LANGUAGE_QUERIES = {"telugu"}
+
+# Release descriptors are ignored only when comparing a song's core title.  A
+# result still keeps its original title in the API response.
+TITLE_VERSION_SUFFIX = re.compile(
+    r"\b(?:remix|remastered|live|acoustic|instrumental|karaoke|version|edit|mix)\b.*$",
+    re.IGNORECASE,
+)
+
 
 def normalize_search_text(value):
     """Return a case-, punctuation-, whitespace-, and accent-insensitive key."""
@@ -57,6 +68,13 @@ def canonical_search_query(query):
     """Apply safe query aliases after normalization."""
     normalized = normalize_search_text(query)
     return QUERY_ALIASES.get(normalized, normalized)
+
+
+def normalized_title_identity(value):
+    """Return a title key that groups legitimate release variants together."""
+    text = normalize_search_text(value)
+    text = TITLE_VERSION_SUFFIX.sub("", text).strip()
+    return text
 
 
 def _song_field(song, *keys):
@@ -108,11 +126,39 @@ def _match_strength(query, value):
     return 0
 
 
+def _all_query_tokens_match(query, value):
+    query_tokens = set(query.split())
+    return bool(query_tokens) and query_tokens.issubset(set(value.split()))
+
+
+def _search_intent(query, candidates):
+    """Infer intent from strong upstream metadata without a broad alias list."""
+    if query in LANGUAGE_QUERIES:
+        return "language"
+    for song in candidates:
+        if not isinstance(song, dict):
+            continue
+        if any(
+            _match_strength(query, normalize_search_text(artist)) >= 700
+            for artist in _artist_values(song)
+        ):
+            return "artist"
+    for song in candidates:
+        if not isinstance(song, dict):
+            continue
+        title = _song_field(song, "title", "song", "name")
+        if query == normalized_title_identity(title):
+            return "title"
+    return "general"
+
+
 def rank_search_results(songs, query):
-    """Deduplicate IDs and rank existing JioSaavn results without extra requests."""
+    """Deduplicate, score, and safely filter existing JioSaavn results."""
     normalized_query = canonical_search_query(query)
     if not normalized_query:
         return []
+
+    intent = _search_intent(normalized_query, songs or [])
 
     ranked = []
     seen_ids = set()
@@ -126,6 +172,8 @@ def rank_search_results(songs, query):
             seen_ids.add(song_id)
 
         title = normalize_search_text(_song_field(song, "title", "song", "name"))
+        title_identity = normalized_title_identity(
+            _song_field(song, "title", "song", "name"))
         artists = [normalize_search_text(value) for value in _artist_values(song)]
         album = normalize_search_text(_song_field(song, "album"))
         language = normalize_search_text(_song_field(song, "language"))
@@ -138,10 +186,29 @@ def rank_search_results(songs, query):
         album_match = _match_strength(normalized_query, album)
         language_match = _match_strength(normalized_query, language)
 
+        # Do not let a provider-side fuzzy match leak unrelated songs into the
+        # response.  Title identity keeps remix/live/acoustic variants. Artist
+        # intent requires artist metadata because provider titles can mention
+        # artists for unrelated covers, karaoke tracks, and emulations.
+        title_identity_match = (
+            title_identity == normalized_query
+            or _all_query_tokens_match(normalized_query, title_identity)
+        )
+        if intent == "artist" and artist_match < 700:
+            continue
+        if intent == "title" and not title_identity_match:
+            continue
+        if intent == "language" and language_match < 700:
+            continue
+        if intent == "general" and max(
+            title_match, artist_match, album_match, language_match
+        ) < 200:
+            continue
+
         # Category weights preserve the requested precedence.  Language is
         # treated as metadata around album strength so searches such as
         # "Telugu" don't get buried beneath unrelated results.
-        if title_match == 1_000:
+        if title_identity == normalized_query:
             score = 7_000
         elif artist_match == 1_000:
             score = 6_000
@@ -244,12 +311,15 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     # JioSaavn search endpoint
     # --------------------------------------------------------
 
+    # Ask for a bounded pool larger than the client page.  Filtering after only
+    # the first requested items can otherwise leave a sparse, low-quality page.
+    upstream_limit = min(max(limit * 4, 20), 50)
     search_url = (
         "https://www.jiosaavn.com/api.php"
         "?__call=search.getResults"
         f"&q={quote(upstream_query)}"
         f"&p={page}"
-        f"&n={limit}"
+        f"&n={upstream_limit}"
         "&_format=json"
         "&_marker=0"
         "&api_version=4"
@@ -295,7 +365,7 @@ def search_for_song(query, lyrics=False, songdata=False, page=1, limit=20):
     if not songs_data:
         return []
 
-    songs_data = rank_search_results(songs_data, query)
+    songs_data = rank_search_results(songs_data, query)[:limit]
 
 
     # --------------------------------------------------------
