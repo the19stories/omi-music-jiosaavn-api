@@ -153,7 +153,7 @@ def _search_intent(query, candidates):
             continue
         if any(
             _match_strength(query, normalize_search_text(artist)) >= 700
-            for artist in _artist_values(song)
+            for artist in _primary_artist_values(song)
         ):
             return "artist"
     for song in candidates:
@@ -208,13 +208,14 @@ def rank_search_results(songs, query):
 
         # Do not let a provider-side fuzzy match leak unrelated songs into the
         # response.  Title identity keeps remix/live/acoustic variants. Artist
-        # intent requires artist metadata because provider titles can mention
-        # artists for unrelated covers, karaoke tracks, and emulations.
+        # intent requires primary artist metadata because provider titles and
+        # composer credits can mention artists for unrelated covers, karaoke
+        # tracks, and emulations.
         title_identity_match = (
             title_identity == normalized_query
             or _all_query_tokens_match(normalized_query, title_identity)
         )
-        if intent == "artist" and artist_match < 700:
+        if intent == "artist" and primary_artist_match < 700:
             continue
         if intent == "title" and not title_identity_match:
             continue
