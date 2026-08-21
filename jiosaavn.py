@@ -109,6 +109,19 @@ def _artist_values(song):
     return [value for value in values if value]
 
 
+def _primary_artist_values(song):
+    """Collect primary-performing artists separately for artist-result ordering."""
+    values = [_song_field(song, "primary_artists", "singers", "artist")]
+    more_info = song.get("more_info")
+    if isinstance(more_info, dict):
+        artist_map = more_info.get("artistMap")
+        if isinstance(artist_map, dict):
+            for artist in artist_map.get("primary_artists", []) or []:
+                if isinstance(artist, dict) and artist.get("name"):
+                    values.append(str(artist["name"]))
+    return [value for value in values if value]
+
+
 def _match_strength(query, value):
     """Score a field using the documented relevance categories."""
     if not value:
@@ -175,12 +188,19 @@ def rank_search_results(songs, query):
         title_identity = normalized_title_identity(
             _song_field(song, "title", "song", "name"))
         artists = [normalize_search_text(value) for value in _artist_values(song)]
+        primary_artists = [
+            normalize_search_text(value) for value in _primary_artist_values(song)
+        ]
         album = normalize_search_text(_song_field(song, "album"))
         language = normalize_search_text(_song_field(song, "language"))
 
         title_match = _match_strength(normalized_query, title)
         artist_match = max(
             (_match_strength(normalized_query, artist) for artist in artists),
+            default=0,
+        )
+        primary_artist_match = max(
+            (_match_strength(normalized_query, artist) for artist in primary_artists),
             default=0,
         )
         album_match = _match_strength(normalized_query, album)
@@ -210,10 +230,14 @@ def rank_search_results(songs, query):
         # "Telugu" don't get buried beneath unrelated results.
         if title_identity == normalized_query:
             score = 7_000
+        elif primary_artist_match == 1_000:
+            score = 6_500
         elif artist_match == 1_000:
             score = 6_000
         elif title_match >= 700:
             score = 5_000 + title_match
+        elif primary_artist_match >= 700:
+            score = 4_500 + primary_artist_match
         elif artist_match >= 700:
             score = 4_000 + artist_match
         elif album_match:
