@@ -110,16 +110,41 @@ def _artist_values(song):
 
 
 def _primary_artist_values(song):
-    """Collect primary-performing artists separately for artist-result ordering."""
-    values = [_song_field(song, "primary_artists", "singers", "artist")]
+    """Read only primary artist metadata; never infer an artist from credits."""
+    source = song.get("primary_artists")
     more_info = song.get("more_info")
-    if isinstance(more_info, dict):
+    if not source and isinstance(more_info, dict):
         artist_map = more_info.get("artistMap")
         if isinstance(artist_map, dict):
-            for artist in artist_map.get("primary_artists", []) or []:
-                if isinstance(artist, dict) and artist.get("name"):
-                    values.append(str(artist["name"]))
-    return [value for value in values if value]
+            source = artist_map.get("primary_artists")
+
+    if isinstance(source, dict):
+        source = [source]
+    if not isinstance(source, list):
+        source = [source] if source else []
+
+    names = []
+    for artist in source:
+        value = artist.get("name") if isinstance(artist, dict) else artist
+        if value:
+            names.extend(str(value).split(","))
+    return [name.strip() for name in names if name and name.strip()]
+
+
+def _deduplicate_search_songs(songs):
+    """Keep first-seen IDs before classifying search intent."""
+    deduplicated = []
+    seen_ids = set()
+    for song in songs or []:
+        if not isinstance(song, dict):
+            continue
+        song_id = str(song.get("id", "")).strip()
+        if song_id and song_id in seen_ids:
+            continue
+        if song_id:
+            seen_ids.add(song_id)
+        deduplicated.append(song)
+    return deduplicated
 
 
 def _match_strength(query, value):
@@ -171,18 +196,12 @@ def rank_search_results(songs, query):
     if not normalized_query:
         return []
 
-    intent = _search_intent(normalized_query, songs or [])
+    songs = _deduplicate_search_songs(songs)
+    intent = _search_intent(normalized_query, songs)
 
     ranked = []
     seen_ids = set()
-    for upstream_index, song in enumerate(songs or []):
-        if not isinstance(song, dict):
-            continue
-        song_id = str(song.get("id", "")).strip()
-        if song_id and song_id in seen_ids:
-            continue
-        if song_id:
-            seen_ids.add(song_id)
+    for upstream_index, song in enumerate(songs):
 
         title = normalize_search_text(_song_field(song, "title", "song", "name"))
         title_identity = normalized_title_identity(

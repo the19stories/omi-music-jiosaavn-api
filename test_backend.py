@@ -60,6 +60,38 @@ class SearchRankingTests(unittest.TestCase):
                 ["weeknd"],
             )
 
+    def test_primary_artist_wins_over_generic_artist_metadata(self):
+        karaoke = song("karaoke", "Starboy (Karaoke)", "ZZang KARAOKE")
+        karaoke["more_info"] = {
+            "artistMap": {
+                "primary_artists": [{"name": "ZZang KARAOKE"}],
+                "artists": [{"name": "The Weeknd"}],
+            },
+            "music": "The Weeknd",
+        }
+        real = song("real", "Starboy", "The Weeknd")
+        results = jiosaavn.rank_search_results([karaoke, real], "The Weeknd")
+        self.assertEqual([item["id"] for item in results], ["real"])
+
+    def test_artist_results_all_have_requested_primary_artist(self):
+        candidates = [
+            song("weeknd", "Starboy", "The Weeknd"),
+            song("lana", "Video Games", "Lana Del Rey"),
+            song("arijit", "Kesariya", "Arijit Singh"),
+            song("wrong", "Cover", "ZZang KARAOKE"),
+        ]
+        for query in ("The Weeknd", "the weekend", "Lana Del Rey", "Arijit Singh"):
+            canonical = jiosaavn.canonical_search_query(query)
+            results = jiosaavn.rank_search_results(candidates, query)
+            self.assertTrue(results)
+            self.assertTrue(all(
+                canonical in {
+                    jiosaavn.normalize_search_text(name)
+                    for name in jiosaavn._primary_artist_values(item)
+                }
+                for item in results
+            ))
+
     def test_other_artist_queries_use_artist_metadata(self):
         candidates = [
             song("lana", "Video Games", "Lana Del Rey"),
